@@ -21,11 +21,21 @@
 NAV_TRANSLATE_HIDDEN int nav_translate(const unsigned char *in, unsigned in_len,
                   unsigned char *out, unsigned out_cap);
 
-/* What the last successful translation carried, for the log. */
+/* Clear cached countdown when NavigationStatus or the AAP session changes. */
+NAV_TRANSLATE_HIDDEN void nav_translate_reset(void);
+
+/* Field availability in the input frame, without retaining names or ETA text. */
+typedef struct nav_route_fields {
+    unsigned steps, lanes, recommended_lanes, destinations, addresses;
+    unsigned destination_distances, destination_meters, eta_texts, eta_seconds;
+} nav_route_fields;
+
+/* Last valid input's route fields and, if translated, the legacy output. */
 typedef struct nav_translate_info {
     unsigned from_id, to_id;
     unsigned event, side, meters, seconds, road_len;
-    int status;
+    int status, fields_valid;
+    nav_route_fields route;
 } nav_translate_info;
 NAV_TRANSLATE_HIDDEN const nav_translate_info *nav_translate_last(void);
 

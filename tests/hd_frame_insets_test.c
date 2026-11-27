@@ -12,6 +12,10 @@ int main(void)
         0x5a, 0x0e, 0x12, 0x0c, 0x08, 0xf4, 0x02, 0x10,
         0xcf, 0x03, 0x18, 0xfa, 0x01, 0x20, 0xfa, 0x01
     };
+    static const unsigned char skoda_720p[] = {
+        0x5a, 0x0e, 0x12, 0x0c, 0x08, 0x8b, 0x02, 0x10,
+        0xfa, 0x02, 0x18, 0x9b, 0x04, 0x20, 0x9b, 0x04
+    };
 
     assert(gal_hd_frame_translate_insets(
         1920u, 1080u, 480u, 625u, 0u, 0u, 0u, 0u,
@@ -41,6 +45,15 @@ int main(void)
         payload, 15u, 372u, 463u, 250u, 250u, 0u) == 0u);
     assert(gal_build_insets_payload(
         payload, sizeof(payload), 372u, 463u, 250u, 250u, 1u) == 18u);
+
+    /* P4526, 1010x376: proposed Google Maps safe area from the Skoda fork. */
+    assert(gal_hd_frame_translate_insets(
+        1280u, 720u, 270u, 344u, 95u, 206u, 404u, 404u,
+        &top, &bottom, &left, &right));
+    assert(top == 267u && bottom == 378u && left == 539u && right == 539u);
+    assert(gal_build_insets_payload(
+        payload, sizeof(payload), top, bottom, left, right, 0u) == sizeof(skoda_720p));
+    assert(memcmp(payload, skoda_720p, sizeof skoda_720p) == 0);
 
     return 0;
 }

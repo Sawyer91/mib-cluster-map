@@ -297,7 +297,8 @@ are this receiver's own `k*FieldNumber` symbols. Host test:
 cc -I src tests/nav_translate_test.c src/nav_translate.c -o /tmp/navtest && /tmp/navtest
 ```
 
-Lanes and the distance and time to the destination are decoded by kombibridge
-but have no field in the old messages. Showing them on the cockpit needs the
-Java side (its `LaneGuidance`, `DistanceToDestination` and `TimeToDestination`
-BAP functions), which is not part of this project yet.
+The old messages have no fields for lanes, destination metadata or ETA.
+`event=nav.fields` reports which of those fields the phone sends before
+translation. The counters omit addresses and ETA text. Raw `aap.nav_msg`
+and `nav.step` frames require `GAL_DUALSCREEN_DEBUG=1`.
+See [the P4526 validation guide](Kodiaq-P4526.md) for the hardware checks.
