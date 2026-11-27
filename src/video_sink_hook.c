@@ -188,6 +188,7 @@ static unsigned long g_channel_seen[256];
 /* Last AAP message id seen per channel, and how many ids were traced, so an
  * "unexpected message" reply can be tied to the message that caused it. */
 static unsigned short g_channel_last_id[256];
+static unsigned g_nav_reset_pending;
 static unsigned char g_channel_traced[256];
 static char g_service_class[256][40];
 typedef void (*unexpected_fn)(void *, unsigned char);
@@ -2559,6 +2560,9 @@ void _ZN10Controller18sendVersionRequestEv(void *receiver)
     unsigned char message[6];
     unsigned minor;
 
+    /* Let the inbound router clear its own cache before the next nav frame. */
+    __atomic_store_n(&g_nav_reset_pending, 1u, __ATOMIC_RELAXED);
+
     /*
      * Unless a version was explicitly configured, hand this straight back to
      * the stock implementation rather than rebuilding the message ourselves.
@@ -2604,6 +2608,28 @@ void _ZN10Controller18sendVersionRequestEv(void *receiver)
                       minor);
     }
     (void)config;
+}
+
+static void log_navigation_fields(const nav_translate_info *info)
+{
+    static nav_route_fields previous[2];
+    static unsigned logged[2];
+    const nav_route_fields *fields = &info->route;
+    unsigned slot = info->from_id == 0x8006u ? 0u : 1u;
+
+    if (logged[slot] >= 200u ||
+        (logged[slot] != 0u && memcmp(&previous[slot], fields, sizeof *fields) == 0))
+        return;
+    previous[slot] = *fields;
+    ++logged[slot];
+    if (slot == 0u)
+        gal_hook_logf("event=nav.fields from=0x8006 steps=%u lanes=%u recommended_lanes=%u destinations=%u addresses=%u",
+                      fields->steps, fields->lanes, fields->recommended_lanes,
+                      fields->destinations, fields->addresses);
+    else
+        gal_hook_logf("event=nav.fields from=0x8007 destinations=%u with_meters=%u with_eta_text=%u with_eta_seconds=%u",
+                      fields->destination_distances, fields->destination_meters,
+                      fields->eta_texts, fields->eta_seconds);
 }
 
 /*
@@ -2666,23 +2692,8 @@ void _ZN13MessageRouter12routeMessageEhRK10shared_ptrI8IoBufferE(
             gal_hook_logf("event=main.input.binding channel=%u bytes=%u request=%s", (unsigned)channel, nb, hex);
         }
     }
-    /*
-     * The navigation messages the unit throws away (issue #4).
-     *
-     * From protocol version 1.6 (GAL_DUALSCREEN_AAP_MINOR=6 or higher; the
-     * shipped settings claim 1.5 for this reason) Google
-     * Maps sends its newer navigation pair on the NavigationStatus service:
-     * 0x8006 carries the road name, 0x8007 the distance and time. This
-     * receiver was built against 1.2, knows only the older 0x8004/0x8005,
-     * and answers -253 -- so the pictogram never updates while the map is
-     * installed, and the arrows only work with the map uninstalled.
-     *
-     * Translating the new pair into the old one has to start from the real
-     * bytes, which no capture has ever carried. Log the first few of each,
-     * then go quiet: these are small messages but they repeat for the whole
-     * of a route, and the log lives in RAM.
-     */
-    if (strstr(g_service_class[channel], "NavigationStatus") != NULL &&
+    /* Raw navigation frames can contain addresses. Record them only in debug mode. */
+    if (gal_hook_is_debug() && strstr(g_service_class[channel], "NavigationStatus") != NULL &&
         (g_channel_last_id[channel] == 0x8006u ||
          g_channel_last_id[channel] == 0x8007u)) {
         static unsigned logged[2];
@@ -2718,7 +2729,7 @@ void _ZN13MessageRouter12routeMessageEhRK10shared_ptrI8IoBufferE(
         (g_channel_last_id[channel] == 0x8003u || g_channel_last_id[channel] == 0x8006u ||
          g_channel_last_id[channel] == 0x8007u)) {
         static int translate = -1;
-        static unsigned long translated;
+        static unsigned long translated, dropped;
         if (translate < 0) {
             const char *v = getenv("GAL_DUALSCREEN_NAV_TRANSLATE");
             translate = (v != NULL && (strcmp(v, "0") == 0 || strcmp(v, "false") == 0 ||
@@ -2729,10 +2740,17 @@ void _ZN13MessageRouter12routeMessageEhRK10shared_ptrI8IoBufferE(
             unsigned nb = 0u;
             unsigned char *m = (unsigned char *)(uintptr_t)iobuffer_bytes(buffer, &nb);
             unsigned char out[256];
-            int n = m != NULL ? nav_translate(m, nb, out, sizeof out) : NAV_TRANSLATE_PASS;
-            const nav_translate_info *t = nav_translate_last();
+            const nav_translate_info *t;
+            int n;
+            if (__atomic_exchange_n(&g_nav_reset_pending, 0u, __ATOMIC_RELAXED))
+                nav_translate_reset();
+            n = m != NULL ? nav_translate(m, nb, out, sizeof out) : NAV_TRANSLATE_PASS;
+            t = nav_translate_last();
+            if (m != NULL && nb >= 2u && t->fields_valid)
+                log_navigation_fields(t);
             if (n == NAV_TRANSLATE_DROP) {
-                if (translated < 10ul)
+                ++dropped;
+                if (dropped <= 10ul || dropped % 200ul == 0ul)
                     gal_hook_logf("event=nav.translate from=0x%04x action=dropped reason=nothing_usable",
                                   g_channel_last_id[channel]);
                 fc_run_mailbox();
@@ -2744,7 +2762,7 @@ void _ZN13MessageRouter12routeMessageEhRK10shared_ptrI8IoBufferE(
                  * tests are about one roundabout or "continue" step in a
                  * drive, and the first dozen messages never reach it.
                  */
-                if (t->to_id == 0x8004u) {
+                if (t->to_id == 0x8004u && gal_hook_is_debug()) {
                     static unsigned last_event = 0xffffffffu, last_side, last_road;
                     static unsigned long changes;
                     if ((t->event != last_event || t->side != last_side ||

@@ -212,6 +212,8 @@ package() {
   sh "$ROOT/tests/cluster_frame_test.sh" >/dev/null || { echo "REJECTED: tests/cluster_frame_test.sh failed"; exit 1; }
   cc -O1 -I "$ROOT/src" "$ROOT/tests/hd_frame_insets_test.c" -o "$ROOT/build/hd_frame_insets_test" &&
      "$ROOT/build/hd_frame_insets_test" >/dev/null || { echo "REJECTED: tests/hd_frame_insets_test.c failed"; exit 1; }
+  cc -O1 -I "$ROOT/src" "$ROOT/tests/nav_translate_test.c" "$ROOT/src/nav_translate.c" -o "$ROOT/build/nav_translate_test" &&
+     "$ROOT/build/nav_translate_test" || { echo "REJECTED: tests/nav_translate_test.c failed"; exit 1; }
   bad=$(perl -ne 'if (/\r|[^\x00-\x7F]/) { print "$ARGV\n"; close ARGV }' "$D"/*.sh "$D"/scripts/*.sh "$D"/GEM/*.sh "$D"/final/*.sh "$D"/carplay/*.sh "$S"/Custom/GreenMenu/*.esd "$D"/gal_dualscreen.conf | sort -u)
   [ -z "$bad" ] || { echo "REJECTED: CR or non-ASCII in: $bad"; exit 1; }
   (cd "$D" && shasum -a 256 libgal_hook.so stream-player profile_check hwcheck/nvprobe hwcheck/clip_800x480.h264 profiles.conf lib/libdmdt_flush.so carplay/libcarplay_cluster.so carplay/ClusterMapWheelZoom.jar carplay/ClusterMapNavAsiaZoom.jar carplay/ClusterMapGfxKeep.jar carplay/AAcoverart_hook.jar > SHA256SUMS.txt)

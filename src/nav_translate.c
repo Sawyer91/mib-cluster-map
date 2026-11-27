@@ -23,8 +23,10 @@
  *   0x8005 NavigationNextTurnDistanceEvent  distanceMeters=1 timeToTurnSeconds=2
  *   0x8003 NavigationStatus         status=1 (0 unavailable, 1 active, 2 inactive)
  *
- * No libc beyond memcpy, so tests/nav_translate_test.c runs it on a host.
+ * The parser also reports field availability for hardware validation.
+ * The legacy messages cannot carry lanes, the address or arrival estimates.
  */
+#include <limits.h>
 #include <string.h>
 #include "nav_translate.h"
 
@@ -33,27 +35,34 @@ static nav_translate_info g_last;
 const nav_translate_info *nav_translate_last(void) { return &g_last; }
 
 /* ---- a bounded protobuf reader ------------------------------------------ */
-typedef struct { const unsigned char *p, *e; } pb;
+typedef struct { const unsigned char *p, *e; int invalid; } pb;
 
 static unsigned pb_var(pb *s)
 {
     unsigned v = 0u;
-    int sh = 0;
-    while (s->p < s->e) {
+    unsigned i;
+    int wide = 0;
+    for (i = 0; i < 10u && s->p < s->e; ++i) {
         unsigned char b = *s->p++;
-        if (sh <= 28) v |= (unsigned)(b & 0x7fu) << sh;
-        if (!(b & 0x80u)) break;
-        sh += 7;
+        unsigned bits = b & 0x7fu;
+        if (i == 9u && b > 1u) break;
+        if (i < 5u) v |= bits << (7u * i);
+        if ((i == 4u && bits > 15u) || (i > 4u && bits != 0u)) wide = 1;
+        if (!(b & 0x80u)) return wide ? UINT_MAX : v;
     }
-    return v;   /* a 10-byte negative saturates; callers range-check */
+    s->invalid = 1;
+    return UINT_MAX;
 }
 
 static int pb_tag(pb *s, unsigned *f, unsigned *w)
 {
     unsigned t;
-    if (s->p >= s->e) return 0;
+    if (s->invalid || s->p >= s->e) return 0;
     t = pb_var(s);
-    if (t == 0u) return 0;
+    if (t < 8u || t == UINT_MAX) {
+        s->invalid = 1;
+        return 0;
+    }
     *f = t >> 3;
     *w = t & 7u;
     return 1;
@@ -62,36 +71,57 @@ static int pb_tag(pb *s, unsigned *f, unsigned *w)
 static int pb_sub(pb *s, pb *o)
 {
     unsigned n = pb_var(s);
-    if (n > (unsigned)(s->e - s->p)) return 0;
+    if (s->invalid || n == UINT_MAX || n > (unsigned)(s->e - s->p)) {
+        s->invalid = 1;
+        return 0;
+    }
     o->p = s->p;
     o->e = s->p + n;
+    o->invalid = 0;
     s->p += n;
     return 1;
 }
 
 static void pb_skip(pb *s, unsigned w)
 {
-    unsigned left = (unsigned)(s->e - s->p), n;
+    unsigned left = (unsigned)(s->e - s->p);
+    pb ignored;
     if (w == 0u) { (void)pb_var(s); return; }
-    if (w == 2u) { n = pb_var(s); left = (unsigned)(s->e - s->p); s->p += n < left ? n : left; return; }
-    if (w == 5u) { s->p += left >= 4u ? 4u : left; return; }
-    if (w == 1u) { s->p += left >= 8u ? 8u : left; return; }
-    s->p = s->e;  /* unknown wire type: stop rather than run off the end */
+    if (w == 2u) { (void)pb_sub(s, &ignored); return; }
+    if (w == 5u && left >= 4u) { s->p += 4u; return; }
+    if (w == 1u && left >= 8u) { s->p += 8u; return; }
+    s->invalid = 1;
 }
 
 /* A string field, cut to fit, without the newlines a cockpit line cannot show. */
 static unsigned pb_str(pb *s, char *dst, unsigned cap)
 {
-    unsigned n = pb_var(s), i, j = 0u;
-    if (n > (unsigned)(s->e - s->p)) n = (unsigned)(s->e - s->p);
-    for (i = 0u; i < n; ++i) {
-        char c = (char)s->p[i];
+    pb value;
+    unsigned j = 0u;
+    if (!pb_sub(s, &value)) return 0u;
+    while (value.p < value.e && j + 1u < cap) {
+        char c = (char)*value.p++;
         if (c == '\n' || c == '\r' || c == '\t') c = ' ';
-        if (j + 1u < cap) dst[j++] = c;
+        dst[j++] = c;
     }
     dst[j] = '\0';
-    s->p += n;
     return j;
+}
+
+static int pb_has_text(pb s, unsigned field)
+{
+    unsigned f, w;
+    int present = 0;
+    while (pb_tag(&s, &f, &w)) {
+        if (f == field && w == 2u) {
+            pb value;
+            if (!pb_sub(&s, &value)) break;
+            present = value.p != value.e;
+        } else {
+            pb_skip(&s, w);
+        }
+    }
+    return s.invalid ? -1 : present;
 }
 
 /* ---- a protobuf writer -------------------------------------------------- */
@@ -159,7 +189,7 @@ typedef struct {
     char road[ROAD_MAX];
 } turn;
 
-static void parse_maneuver(pb s, turn *t)
+static int parse_maneuver(pb s, turn *t)
 {
     unsigned f, w, v;
     while (pb_tag(&s, &f, &w)) {
@@ -179,11 +209,38 @@ static void parse_maneuver(pb s, turn *t)
             pb_skip(&s, w);
         }
     }
+    return !s.invalid;
+}
+
+static int parse_lane(pb s, nav_route_fields *route)
+{
+    unsigned f, w;
+    int has_shape = 0, recommended = 0;
+    while (pb_tag(&s, &f, &w)) {
+        pb direction;
+        unsigned df, dw, shape = 0u, highlight = 0u;
+        if (f != 1u || w != 2u) { pb_skip(&s, w); continue; }
+        if (!pb_sub(&s, &direction)) break;
+        while (pb_tag(&direction, &df, &dw)) {
+            if (df == 1u && dw == 0u) shape = pb_var(&direction);
+            else if (df == 2u && dw == 0u) highlight = pb_var(&direction);
+            else pb_skip(&direction, dw);
+        }
+        if (direction.invalid) return 0;
+        if (shape >= 1u && shape <= 9u) {
+            has_shape = 1;
+            if (highlight) recommended = 1;
+        }
+    }
+    if (s.invalid) return 0;
+    route->lanes += has_shape;
+    route->recommended_lanes += recommended;
+    return 1;
 }
 
 /* NavigationStep { maneuver=1; instruction=2 {text=1}; lanes=3; road_info=4 {road_names=1} }.
  * The road name wins over the spoken instruction, whatever order they come in. */
-static void parse_step(pb s, turn *t)
+static int parse_step(pb s, turn *t, nav_route_fields *route)
 {
     char cue[ROAD_MAX];
     unsigned cue_len = 0u, f, w;
@@ -196,12 +253,14 @@ static void parse_step(pb s, turn *t)
         if (w != 2u) { pb_skip(&s, w); continue; }
         if (!pb_sub(&s, &d)) break;
         if (f == 1u) {
-            parse_maneuver(d, t);
+            if (!parse_maneuver(d, t)) return 0;
         } else if (f == 2u) {
             while (pb_tag(&d, &df, &dw)) {
                 if (df == 1u && dw == 2u) cue_len = pb_str(&d, cue, sizeof cue);
                 else pb_skip(&d, dw);
             }
+        } else if (f == 3u) {
+            if (!parse_lane(d, route)) return 0;
         } else if (f == 4u) {
             while (pb_tag(&d, &df, &dw)) {
                 if (df == 1u && dw == 2u && t->road_len == 0u)
@@ -209,51 +268,82 @@ static void parse_step(pb s, turn *t)
                 else pb_skip(&d, dw);
             }
         }
+        if (d.invalid) return 0;
     }
     if (t->road_len == 0u && cue_len > 0u) {
         memcpy(t->road, cue, cue_len + 1u);
         t->road_len = cue_len;
     }
+    return !s.invalid;
 }
 
 /* Distances survive between messages: an "unknown" 0x8007 keeps the last
  * good countdown on the cockpit instead of blanking it. */
-static unsigned g_meters, g_seconds;
-static int g_have_distance;
+static int g_meters = -1;
 
-/* NavigationCurrentPosition { step=1 { distance=1 { meters=1 }; time_to_step_seconds=2 } } */
-static int parse_position(pb s)
+void nav_translate_reset(void)
 {
-    unsigned f, w, df, dw, nf, nw, v;
-    int got = 0, got_time = 0;
+    g_meters = -1;
+}
+
+static int parse_meters(pb s, int *meters)
+{
+    unsigned f, w;
     while (pb_tag(&s, &f, &w)) {
-        pb d, n;
-        if (!(f == 1u && w == 2u)) { pb_skip(&s, w); continue; }
-        if (!pb_sub(&s, &d)) break;
-        while (pb_tag(&d, &df, &dw)) {
-            if (df == 1u && dw == 2u) {
-                if (!pb_sub(&d, &n)) break;
-                while (pb_tag(&n, &nf, &nw)) {
-                    if (nf == 1u && nw == 0u) {
-                        v = pb_var(&n);
-                        /* -1 ("unknown") arrives as a saturated varint */
-                        if (v <= 20000000u) { g_meters = v; got = 1; }
-                    } else {
-                        pb_skip(&n, nw);
-                    }
-                }
-            } else if (df == 2u && dw == 0u) {
-                v = pb_var(&d);
-                if (v <= 1000000u) { g_seconds = v; got = got_time = 1; }
-            } else {
-                pb_skip(&d, dw);
-            }
+        if (f == 1u && w == 0u) {
+            unsigned value = pb_var(&s);
+            *meters = value <= 20000000u ? (int)value : -1;
+        } else {
+            pb_skip(&s, w);
         }
     }
-    /* Waze sends no time: a figure from the app before it would be stale. */
-    if (!got_time) g_seconds = 0u;
-    if (got) g_have_distance = 1;
-    return g_have_distance;
+    return !s.invalid;
+}
+
+/* Both position entries contain a distance. Field 2 is step seconds or
+ * destination ETA text depending on the entry, and field 3 is arrival seconds. */
+static int parse_position_entry(pb s, int destination, int *meters, int *seconds,
+                                int *eta_text)
+{
+    unsigned f, w;
+    while (pb_tag(&s, &f, &w)) {
+        pb value;
+        if (f == 1u && w == 2u) {
+            if (!pb_sub(&s, &value) || !parse_meters(value, meters)) return 0;
+        } else if (f == (destination ? 3u : 2u) && w == 0u) {
+            unsigned v = pb_var(&s);
+            *seconds = v <= 1000000u ? (int)v : -1;
+        } else if (destination && f == 2u && w == 2u) {
+            if (!pb_sub(&s, &value)) return 0;
+            *eta_text = value.p != value.e;
+        } else {
+            pb_skip(&s, w);
+        }
+    }
+    return !s.invalid;
+}
+
+static int parse_position(pb s, int *step_meters, int *step_seconds,
+                          int *have_step, nav_route_fields *route)
+{
+    unsigned f, w;
+    while (pb_tag(&s, &f, &w)) {
+        pb entry;
+        if ((f != 1u && f != 2u) || w != 2u) { pb_skip(&s, w); continue; }
+        if (!pb_sub(&s, &entry)) break;
+        if (f == 1u) {
+            if (!parse_position_entry(entry, 0, step_meters, step_seconds, NULL)) return 0;
+            *have_step = 1;
+        } else {
+            int meters = -1, seconds = -1, eta_text = 0;
+            if (!parse_position_entry(entry, 1, &meters, &seconds, &eta_text)) return 0;
+            ++route->destination_distances;
+            route->destination_meters += meters >= 0;
+            route->eta_texts += eta_text;
+            route->eta_seconds += seconds >= 0;
+        }
+    }
+    return !s.invalid;
 }
 
 int nav_translate(const unsigned char *in, unsigned in_len,
@@ -271,25 +361,33 @@ int nav_translate(const unsigned char *in, unsigned in_len,
     o.n = 0u;
     o.cap = out_cap < in_len ? out_cap : in_len;   /* must fit over the original */
     o.full = 0;
+    s.invalid = 0;
     memset(&g_last, 0, sizeof g_last);
     g_last.from_id = id;
     g_last.status = -1;
 
     if (id == 0x8006u) {
         /* NavigationState { repeated NavigationStep steps=1; ... }: the first step is the next turn */
-        turn t;
-        int have = 0;
+        turn t = {0};
+        nav_route_fields route = {0};
         while (pb_tag(&s, &f, &w)) {
-            if (f == 1u && w == 2u && !have) {
-                pb d;
-                if (!pb_sub(&s, &d)) break;
-                parse_step(d, &t);
-                have = 1;
+            pb entry;
+            if ((f != 1u && f != 2u) || w != 2u) { pb_skip(&s, w); continue; }
+            if (!pb_sub(&s, &entry)) break;
+            if (f == 1u) {
+                if (route.steps == 0u && !parse_step(entry, &t, &route)) return NAV_TRANSLATE_DROP;
+                ++route.steps;
             } else {
-                pb_skip(&s, w);
+                int address = pb_has_text(entry, 1u);
+                if (address < 0) return NAV_TRANSLATE_DROP;
+                ++route.destinations;
+                route.addresses += address;
             }
         }
-        if (!have) return NAV_TRANSLATE_DROP;
+        if (s.invalid) return NAV_TRANSLATE_DROP;
+        g_last.route = route;
+        g_last.fields_valid = 1;
+        if (route.steps == 0u) return NAV_TRANSLATE_DROP;
         pw_byte(&o, 0x80u);
         pw_byte(&o, 0x04u);
         if (t.road_len > 0u) pw_string(&o, 1u, t.road, t.road_len);
@@ -305,35 +403,46 @@ int nav_translate(const unsigned char *in, unsigned in_len,
         return (int)o.n;
     }
     if (id == 0x8007u) {
-        if (!parse_position(s)) return NAV_TRANSLATE_DROP;
+        nav_route_fields route = {0};
+        int meters = -1, seconds = -1, have_step = 0;
+        unsigned legacy_seconds;
+        if (!parse_position(s, &meters, &seconds, &have_step, &route)) return NAV_TRANSLATE_DROP;
+        g_last.route = route;
+        g_last.fields_valid = 1;
+        if (!have_step) return NAV_TRANSLATE_DROP;
+        if (meters < 0) meters = g_meters;
+        if (meters < 0) return NAV_TRANSLATE_DROP;
+        /* A phone may omit time even when it sends a usable distance. */
+        legacy_seconds = seconds < 0 ? 0u : (unsigned)seconds;
         pw_byte(&o, 0x80u);
         pw_byte(&o, 0x05u);
-        pw_uint(&o, 1u, g_meters);
-        pw_uint(&o, 2u, g_seconds);
+        pw_uint(&o, 1u, (unsigned)meters);
+        pw_uint(&o, 2u, legacy_seconds);
         if (o.full) return NAV_TRANSLATE_PASS;
+        g_meters = meters;
         g_last.to_id = 0x8005u;
-        g_last.meters = g_meters;
-        g_last.seconds = g_seconds;
+        g_last.meters = (unsigned)meters;
+        g_last.seconds = legacy_seconds;
         return (int)o.n;
     }
     if (id == 0x8003u) {
         /* 1.7 adds status 3, REROUTING, which the 1.2 enum stops short of.
          * During a recalculation the route is still on: call it ACTIVE. */
+        unsigned status = UINT_MAX;
         while (pb_tag(&s, &f, &w)) {
-            if (f == 1u && w == 0u) {
-                unsigned v = pb_var(&s);
-                if (v != 3u) return NAV_TRANSLATE_PASS;
-                pw_byte(&o, 0x80u);
-                pw_byte(&o, 0x03u);
-                pw_uint(&o, 1u, 1u);
-                if (o.full) return NAV_TRANSLATE_PASS;
-                g_last.to_id = 0x8003u;
-                g_last.status = 1;
-                return (int)o.n;
-            }
-            pb_skip(&s, w);
+            if (f == 1u && w == 0u) status = pb_var(&s);
+            else pb_skip(&s, w);
         }
-        return NAV_TRANSLATE_PASS;
+        if (s.invalid) return NAV_TRANSLATE_DROP;
+        if (status == 0u || status == 2u || status == 3u) nav_translate_reset();
+        if (status != 3u) return NAV_TRANSLATE_PASS;
+        pw_byte(&o, 0x80u);
+        pw_byte(&o, 0x03u);
+        pw_uint(&o, 1u, 1u);
+        if (o.full) return NAV_TRANSLATE_PASS;
+        g_last.to_id = 0x8003u;
+        g_last.status = 1;
+        return (int)o.n;
     }
     return NAV_TRANSLATE_PASS;
 }
